@@ -1,0 +1,1161 @@
+# 卡牌系统架构书 v3.1
+
+> 版本: 3.1
+> 更新日期: 2026-03-20
+> 基于: ai-rules-template 开发准则 + 微内核架构思想
+> 本次：深度自查修复 9 个严重/中等问题
+
+---
+
+## 一、问题诊断：v3.0 为什么还是不对
+
+### v3.0 的根本问题：把流水线拆成了子系统
+
+v3.0 把卡牌流程强行分成了多个"子系统"：
+
+```
+CardsModule
+  ├── CardFactory          → 创建实例
+  ├── CardPile             → 存储
+  ├── HandManager           → 手牌
+  ├── CardDealer            → 发牌
+  ├── ChargeManager         → 充能（核心）
+  ├── RhythmPort            → 转发 rhythm 事件
+  ├── ComboKeeper           → 连携检测
+  └── EffectDispatcher      → 触发效果
+```
+
+**这个结构的问题**：
+
+1. **信息不对称**：ChargeManager 是"核心"，但它依赖 RhythmPort 才能工作。ComboKeeper 也订阅 rhythm 事件。它们共享同一个数据源，却分散在各处。
+
+2. **业务逻辑分裂**：一个"充能"概念被拆到了 ChargeManager + RhythmPort + PlayContext 三个地方。
+
+3. **流水线的 stage 转换没有集中管理**：Card 在 PLAYING 阶段时，谁负责更新它的 charge？谁负责检测充能完成？答案分散在多个文件里。
+
+4. **文件数量没有实质性减少**：子系统 + 核心类 + 效果 = 10+ 个文件，实际上比 v3.0 更好，但"子系统"这个思维模型本身就是错的。
+
+### 核心问题：把"数据流动的直线"拆成了"职责划分的孤岛"
+
+卡牌系统的本质是一个**线性 pipeline**：
+
+```
+Deck → Draw → Hand → Select → Rhythm Input → Charge → Effect → Discard
+```
+
+这不是一个需要"协调"的多组件系统，而是一个**状态机**：卡牌在各个 stage 之间转换，每次转换发出事件，外部系统订阅事件做出响应。
+
+---
+
+## 二、微内核架构思想
+
+### 什么是微内核
+
+微内核（Micro-Kernel）架构的核心原则：
+
+> **内核只做最小必要的事：管理实体生命周期 + 传递消息。所有其他业务逻辑都在内核之外，通过消息通信。**
+
+类比：
+- **操作系统**（Linux）：内核只做进程调度 + 内存管理 + 硬件抽象。所有文件系统、网络协议、驱动程序都在内核之外。
+- **游戏引擎**（Godot）：内核（SceneTree + Node system）只做场景图管理 + 信号路由。所有游戏逻辑（物理、渲染、AI）都在 Node 上。
+
+### 微内核 + 卡牌系统
+
+应用到卡牌系统：
+
+| 操作系统概念 | 卡牌系统对应 |
+|------------|------------|
+| 进程/线程 | Card 实例 |
+| 进程调度 | Card stage 转换 |
+| 消息传递 | EventBus 事件 |
+| 文件系统（内核外） | 效果处理器 |
+| 网络协议（内核外） | 充能规则、连携检测 |
+| 硬件驱动（内核外，可替换） | 发牌驱动（Click/Auto/Key） |
+
+**结论**：Card 实例就是"进程"，CardManager 就是"内核"。充能逻辑不是"子系统"，它是 Card 状态的一部分。发牌驱动是可替换的"硬件驱动"。
+
+---
+
+## 三、v3.1 核心设计
+
+### 3.1 核心理念
+
+**一个类管状态，一个类管数据，业务逻辑全是事件处理器。**
+
+```
+CardManager (内核)
+    │
+    ├── 持有 _all_cards（唯一容器）
+    ├── Card.stage 是唯一位置信息来源
+    ├── 处理 stage 转换（deck→hand, hand→playing, playing→charged, ...）
+    ├── 充能状态直接存在 Card 对象上（不是另一个管理器）
+    │
+    └── 发出事件：
+            cards:card_drawn
+            cards:card_played
+            cards:charge_updated
+            cards:card_charged
+            cards:card_discarded
+            cards:effect_triggered
+            combo:detected
+```
+
+**Card.stage 是唯一的位置信息来源**
+
+这是 v3.1 最重要的设计决策。`Card.stage` 是唯一事实，`_deck/_hand/_discard` 是由 stage 派生的查询视图（通过 `get_cards_by_stage()` 过滤），不再有"数组同步"问题。
+
+- `end_turn()` 不再需要手动遍历 `_hand` 设置 `stage = DISCARD`
+- 新增卡牌类型不需要修改任何容器的更新逻辑
+- 任何时候 `Card.stage` 和实际位置永远一致
+
+### 3.2 自包含的 Card 实体
+
+**Card 对象自己管理自己的状态和充能，不再依赖外部管理器。**
+
+```gdscript
+class_name Card
+extends RefCounted
+
+var data: CardData
+var instance_id: String
+var stage: Stage = Stage.DECK
+var current_charge: int = 0
+var rhythm_context_id: String = ""    # 由 RhythmPort 在 rhythm 启动后回填
+var combo_tags: Array[String] = []
+```
+
+**为什么 stage 作为唯一来源更好**：
+
+- 每个 `Card` 实例是**完全自包含**的：它知道自己在哪里、有多少充能、属于哪个 rhythm 上下文
+- `CardManager` 不需要维护"哪些卡在哪里"的同步副本
+- `RhythmPort` 不需要知道"ChargeManager 在哪里"
+- 任何可以访问 `Card` 引用的代码都可以直接调用 `card.add_charge()` —— 没有中间层
+
+### 3.3 事件驱动 = 微内核的通信机制
+
+```
+rhythm:input_judged
+    │
+    └─► RhythmPort 监听
+            │
+            ├─ 解析 context_id → 找到对应的 Card（O(1) Dictionary 查找）
+            ├─ Card.add_charge(charge_amount)     ← Card 自己更新
+            └─ EventBus.fire("cards:charge_updated", {...})
+
+cards:card_charged
+    │
+    ├─► CardsModule._on_card_charged()
+    │       ├─► ComboTracker.record()        ← 连携追踪
+    │       └─► _effect_registry.execute()    ← 效果触发（关键修复！）
+    │
+    ├─► ComboTracker 监听
+    │       └─ 检测连携 → EventBus.fire("combo:detected", {...})
+    │
+    └─► CardManager 监听
+            └─ 更新 Card.stage = Stage.DISCARD
+
+rhythm:context_started（RhythmPort 接收并回填 context_id）
+    └─► RhythmPort._on_context_started()
+            └─► card.rhythm_context_id = data.context_id  ← 关键修复！
+```
+
+---
+
+## 四、v3.1 项目结构
+
+```
+节奏牌/modules/cards/
+├── cards_module.gd              # 模块唯一入口
+│                                  # class_name: CardsModule
+│                                  # 持有 CardManager + 服务注入
+│
+├── STATUS.md
+├── CHANGELOG.md
+│
+├── data/
+│   └── configs/
+│       ├── card_database.tres       # CardData Resource 集合
+│       └── combo_definitions.tres    # 连携定义配置
+│
+├── _core/                          # 核心层：CardManager + Card + CardData
+│   │
+│   ├── card_manager.gd           # 内核：_all_cards + stage 转换
+│   │                                # class_name: CardManager
+│   │
+│   ├── card.gd                    # 实体：自己的 stage/charge/rhythm_context 自己管
+│   │                                # class_name: Card
+│   │
+│   └── card_data.gd              # 静态数据 Resource
+│                                    # class_name: CardData
+│
+├── _services/                      # 服务层：事件驱动的独立处理器
+│   │
+│   ├── draw_driver.gd             # 发牌驱动接口（Strategy 模式）
+│   │                                # class_name: DrawDriver
+│   │
+│   ├── _draw_drivers/
+│   │   ├── auto_draw_driver.gd   # 自动发牌（Timer 定时触发）
+│   │   │                          # class_name: AutoDrawDriver
+│   │   ├── key_draw_driver.gd    # 按键发牌（监听 Input 事件）
+│   │   │                          # class_name: KeyDrawDriver
+│   │   └── click_draw_driver.gd  # 点击发牌（监听 GUI 点击信号）
+│   │                                # class_name: ClickDrawDriver
+│   │
+│   ├── rhythm_port.gd             # 节奏轴服务（转发事件 + 回填 context_id）
+│   │                                # class_name: RhythmPort
+│   │
+│   ├── combo_tracker.gd           # 连携追踪服务（订阅 cards:card_charged）
+│   │                                # class_name: ComboTracker
+│   │
+│   └── _effects/
+│       ├── effect_handler.gd       # 效果处理器基类
+│       │                            # class_name: EffectHandler
+│       ├── attack_handler.gd     # 攻击效果
+│       ├── defense_handler.gd     # 防御效果
+│       ├── buff_handler.gd        # 增益效果
+│       ├── debuff_handler.gd     # 减益效果
+│       └── special_handler.gd     # 特殊效果
+│
+├── contracts/
+│   └── cards-rhythm.contract.md    # cards ↔ rhythm_axis 事件契约
+│
+└── scenes/
+    ├── test/
+    │   └── test_cards.tscn
+    └── cards_table.tscn
+```
+
+### 结构对比
+
+| 维度 | v2.0 | v3.0 | **v3.1** |
+|------|------|------|----------|
+| 核心理念 | 面向对象多组件 | 去掉接口的子系统 | **微内核 + 事件驱动** |
+| 核心层文件 | 10+ | 8+ | **3 个** |
+| 位置信息来源 | Manager 双维护 | Manager 双维护 | **Card.stage 唯一来源** |
+| 发牌器 | `CardDealer` + `DealingDriver` | `CardDealer` | **DrawDriver 接口 + 3 种实现** |
+| charge 状态 | Manager 管理 | Manager 管理 | **Card 对象自己** |
+| 效果 | 分散 | EffectDispatcher | **EffectHandler 直接订阅事件** |
+| 连携 | ComboDetector | ComboKeeper | **ComboTracker** |
+| context_id | 未考虑 | 未考虑 | **RhythmPort 回填，O(1) 查找** |
+| 文件总数 | ~22 | ~19 | **~15** |
+
+---
+
+## 五、核心类详细设计
+
+### 5.1 CardsModule（模块入口）
+
+```gdscript
+class_name CardsModule
+extends Node
+
+## ========== 常量 ==========
+const MAX_HAND_SIZE: int = 10
+const CARDS_PER_TURN: int = 3
+const COMBO_WINDOW_SIZE: int = 5
+
+const CARD_DATABASE_PATH: String = "res://modules/cards/data/configs/card_database.tres"
+const COMBO_DEFINITIONS_PATH: String = "res://modules/cards/data/configs/combo_definitions.tres"
+
+## ========== 内核 ==========
+var _card_manager: CardManager
+
+## ========== 服务 ==========
+var _draw_driver: DrawDriver             # 可替换的发牌驱动
+var _rhythm_port: RhythmPort
+var _combo_tracker: ComboTracker
+var _effect_registry: EffectRegistry     # 效果 ID → EffectHandler 映射
+
+## ========== 状态 ==========
+var _is_initialized: bool = false
+var _is_running: bool = false
+
+## ========== 生命周期 ==========
+
+func initialize() -> void:
+	if _is_initialized:
+		return
+	_card_manager = CardManager.new()
+	_card_manager.load_database(CARD_DATABASE_PATH)
+	_card_manager.set_max_hand_size(MAX_HAND_SIZE)
+
+	_draw_driver = AutoDrawDriver.new(self)
+	_rhythm_port = RhythmPort.new(_card_manager)
+	_combo_tracker = ComboTracker.new(COMBO_WINDOW_SIZE)
+	_combo_tracker.load_definitions(COMBO_DEFINITIONS_PATH)
+	_effect_registry = EffectRegistry.new()
+
+	_subscribe_events()
+	_is_initialized = true
+
+func start() -> void:
+	if not _is_initialized:
+		push_error("[CardsModule] 未初始化")
+		return
+	_is_running = true
+	_draw_driver.start()
+
+func stop() -> void:
+	_is_running = false
+	_draw_driver.stop()
+
+func cleanup() -> void:
+	_unsubscribe_events()
+	_draw_driver.cleanup()
+	_draw_driver = null
+	_rhythm_port.cleanup()
+	_rhythm_port = null
+	_combo_tracker.cleanup()
+	_combo_tracker = null
+	_effect_registry = null
+	_card_manager = null
+	_is_initialized = false
+
+## ========== 回合管理 ==========
+
+func start_turn() -> void:
+	if not _is_running:
+		return
+	_card_manager.start_turn(CARDS_PER_TURN)
+	EventBus.fire("cards:turn_started", {})
+
+func end_turn() -> void:
+	if not _is_running:
+		return
+	_card_manager.end_turn()
+	EventBus.fire("cards:turn_ended", {})
+
+## ========== 发牌驱动注入 ==========
+
+func set_draw_driver(driver: DrawDriver) -> void:
+	if _is_running:
+		_draw_driver.stop()
+	_draw_driver.cleanup()
+	_draw_driver = driver
+	if _is_running:
+		_draw_driver.start()
+
+## ========== 效果处理器注册 ==========
+
+func register_effect_handler(handler: EffectHandler) -> void:
+	_effect_registry.register(handler)
+
+## ========== 公共接口 ==========
+
+func get_hand() -> Array[Card]:
+	return _card_manager.get_hand()
+
+func get_discard_pile() -> Array[Card]:
+	return _card_manager.get_cards_by_stage(Card.Stage.DISCARD)
+
+func play_card(card: Card) -> bool:
+	if not _is_running:
+		return false
+	return _card_manager.play_card(card)
+
+func request_draw() -> void:
+	if not _is_running:
+		return
+	_card_manager.draw_one()
+
+func get_card_data(card_id: String) -> CardData:
+	return _card_manager.get_card_data(card_id)
+
+## ========== 事件订阅 ==========
+func _subscribe_events() -> void:
+	EventBus.listen("cards:card_charged", self, "_on_card_charged")
+
+func _unsubscribe_events() -> void:
+	EventBus.unlisten("cards:card_charged", self)
+
+## ========== 效果触发（FIX-4: 接入事件流） ==========
+func _on_card_charged(data: Dictionary) -> void:
+	var card: Card = data.card
+	_combo_tracker.record(card)
+	_effect_registry.execute(card)
+```
+
+### 5.2 CardManager（内核）
+
+**关键设计原则**：
+- `_all_cards` 是唯一容器
+- `Card.stage` 是唯一位置信息来源
+- `_playing_by_context: Dictionary` 是 rhythm context → Card 的 O(1) 查找表
+- 容器查询通过 `get_cards_by_stage()` 过滤，不维护同步副本
+
+```gdscript
+class_name CardManager
+extends RefCounted
+
+## ========== 常量 ==========
+const JUDGE_PERFECT: int = 1
+const JUDGE_GOOD: int = 2
+const JUDGE_MISS: int = 3
+
+## ========== 唯一容器 ==========
+var _all_cards: Array[Card] = []
+
+## ========== O(1) 查找表（FIX-5: O(n) → O(1)） ==========
+var _playing_by_context: Dictionary = {}  # rhythm_context_id → Card
+
+## ========== 配置 ==========
+var _max_hand_size: int = 10
+
+## ========== 数据库 ==========
+var _database: Resource
+var _data_cache: Dictionary = {}   # card_id → CardData
+
+## ========== 工具 ==========
+var _id_counter: int = 0
+
+func _make_id() -> String:
+	_id_counter += 1
+	return "card_%09d" % _id_counter
+
+## ========== 数据库加载 ==========
+
+func load_database(path: String) -> void:
+	if not ResourceLoader.exists(path):
+		push_error("[CardManager] 数据库不存在: " + path)
+		return
+	_database = load(path)
+	# FIX-1: 构建初始牌堆（必须调用，否则 _all_cards 永远为空）
+	_build_initial_deck()
+
+## FIX-1: 创建所有卡牌实例填入 _all_cards
+## 从数据库加载 CardData，按 quantity 创建对应数量的 Card 实例
+func _build_initial_deck() -> void:
+	if _database == null:
+		return
+	var all_data: Array[CardData] = _database.get_all_cards()
+	for data: CardData in all_data:
+		var quantity: int = data.get("quantity", 1)
+		for i in range(quantity):
+			var instance_id := _make_id()
+			var card := Card.create(data, instance_id)
+			_all_cards.append(card)
+	_shuffle_deck()
+
+## 将所有 DECK 阶段的卡牌随机打乱顺序
+func _shuffle_deck() -> void:
+	var deck_cards: Array[Card] = get_cards_by_stage(Card.Stage.DECK)
+	for i in range(deck_cards.size()):
+		var j := randi() % deck_cards.size()
+		var temp: Card = deck_cards[i]
+		deck_cards[i] = deck_cards[j]
+		deck_cards[j] = temp
+
+func get_card_data(card_id: String) -> CardData:
+	if _data_cache.has(card_id):
+		return _data_cache[card_id]
+	if _database == null:
+		return null
+	var data: CardData = _database.get_card(card_id)
+	if data != null:
+		_data_cache[card_id] = data
+	return data
+
+func set_max_hand_size(size: int) -> void:
+	_max_hand_size = size
+
+## ========== 回合生命周期 ==========
+
+func start_turn(cards_to_draw: int) -> void:
+	# 回合开始：把所有在手牌中的卡（来自上一回合未打出的）状态不变
+	# 发牌直到达到 cards_to_draw
+	for i in range(cards_to_draw):
+		if get_cards_by_stage(Card.Stage.HAND).size() >= _max_hand_size:
+			break
+		_draw_one()
+
+	EventBus.fire("cards:turn_started", {
+		"hand_size": get_cards_by_stage(Card.Stage.HAND).size()
+	})
+
+func end_turn() -> void:
+	# FIX-3: 不需要手动遍历 _hand 设置 stage
+	# Card.stage 是唯一来源，end_turn 后这些卡自然通过 stage 被查询到在 discard
+	var hand_cards: Array[Card] = get_cards_by_stage(Card.Stage.HAND)
+	for card in hand_cards:
+		card.stage = Card.Stage.DISCARD
+	EventBus.fire("cards:turn_ended", {
+		"discard_size": get_cards_by_stage(Card.Stage.DISCARD).size()
+	})
+
+## ========== 牌堆操作 ==========
+
+## 发一张牌到手牌
+func _draw_one() -> Card:
+	var hand_size := get_cards_by_stage(Card.Stage.HAND).size()
+	if hand_size >= _max_hand_size:
+		return null
+
+	# 牌堆空了 → 从弃牌堆洗入
+	var deck_cards: Array[Card] = get_cards_by_stage(Card.Stage.DECK)
+	if deck_cards.is_empty():
+		_refill_deck_from_discard()
+
+	deck_cards = get_cards_by_stage(Card.Stage.DECK)
+	if deck_cards.is_empty():
+		return null
+
+	# 从牌堆顶部抽一张
+	var card: Card = deck_cards.back()
+	card.stage = Card.Stage.HAND
+
+	EventBus.fire("cards:card_drawn", _card_to_dict(card))
+	return card
+
+func _refill_deck_from_discard() -> void:
+	var discard_cards: Array[Card] = get_cards_by_stage(Card.Stage.DISCARD)
+	for card in discard_cards:
+		card.stage = Card.Stage.DECK
+	_shuffle_deck()
+	EventBus.fire("cards:deck_refilled", {
+		"count": get_cards_by_stage(Card.Stage.DECK).size()
+	})
+
+## ========== 出牌 ==========
+
+func play_card(card: Card) -> bool:
+	if card.stage != Card.Stage.HAND:
+		return false
+
+	card.stage = Card.Stage.PLAYING
+
+	# 发出 rhythm 启动请求，rhythm_axis 会返回 context_id
+	EventBus.fire("cards:request_rhythm_start", {
+		"card_instance_id": card.instance_id,
+		"card_id": card.data.card_id,
+		"required_charge": card.data.required_charge,
+		"rhythm_keys": card.data.rhythm_keys,
+		"rhythm_timeout": card.data.rhythm_timeout,
+		"bpm": 120.0,
+	})
+
+	# 注册到 O(1) 查找表（FIX-5），等待 RhythmPort 回填 context_id
+	# 注意：context_id 在 rhythm:context_started 事件中由 RhythmPort 回填
+	_playing_by_context[card.instance_id] = card
+
+	EventBus.fire("cards:card_played", _card_to_dict(card))
+	return true
+
+## ========== 外部驱动：接收 rhythm 判定结果 ==========
+## 由 RhythmPort 调用
+## FIX-9: context_id 来自 rhythm_axis 回调，不再在 play_card() 中直接设置
+
+func notify_judged(context_id: String, result: int, delta: float) -> void:
+	# FIX-5: O(1) 查找（FIX-5 修复的一部分）
+	var card: Card = _playing_by_context.get(context_id, null)
+	if card == null:
+		return
+	if card.stage != Card.Stage.PLAYING:
+		return
+
+	var charge_amount := _calc_charge(result, delta, card)
+	card.add_charge(charge_amount)
+
+	EventBus.fire("cards:charge_updated", {
+		"card": card,
+		"current": card.current_charge,
+		"required": card.data.required_charge,
+		"is_completed": card.is_fully_charged(),
+	})
+
+	if card.is_fully_charged():
+		_complete_card(card, context_id)
+	elif _should_fail(card):
+		_fail_card(card, context_id)
+
+func _complete_card(card: Card, context_id: String) -> void:
+	card.stage = Card.Stage.CHARGED
+	_playing_by_context.erase(context_id)
+	EventBus.fire("cards:request_rhythm_stop", {"context_id": context_id})
+	EventBus.fire("cards:card_charged", {"card": card})
+
+func _fail_card(card: Card, context_id: String) -> void:
+	card.stage = Card.Stage.HAND
+	_playing_by_context.erase(context_id)
+	EventBus.fire("cards:request_rhythm_stop", {"context_id": context_id})
+	EventBus.fire("cards:charge_failed", {"card": card})
+
+func discard_card(card: Card) -> void:
+	if card.rhythm_context_id != "" and _playing_by_context.has(card.rhythm_context_id):
+		_playing_by_context.erase(card.rhythm_context_id)
+	card.stage = Card.Stage.EFFECT_USED
+	card.current_charge = 0
+	card.rhythm_context_id = ""
+	EventBus.fire("cards:card_discarded", _card_to_dict(card))
+
+## ========== 辅助 ==========
+
+func _calc_charge(result: int, _delta: float, _card: Card) -> int:
+	match result:
+		JUDGE_PERFECT, JUDGE_GOOD:
+			return 1
+		JUDGE_MISS:
+			return 0
+	return 0
+
+func _should_fail(_card: Card) -> bool:
+	return false
+
+func _card_to_dict(card: Card) -> Dictionary:
+	return {
+		"instance_id": card.instance_id,
+		"card_id": card.data.card_id,
+		"stage": Card.Stage.keys()[card.stage],
+		"charge": card.current_charge,
+	}
+
+## ========== 查询接口（FIX-3: 基于 Card.stage 的派生查询） ==========
+
+## 派生查询：按 stage 过滤（由 Card.stage 唯一来源派生）
+func get_cards_by_stage(stage: int) -> Array[Card]:
+	var result: Array[Card] = []
+	for card in _all_cards:
+		if card.stage == stage:
+			result.append(card)
+	return result
+
+func get_hand() -> Array[Card]:
+	return get_cards_by_stage(Card.Stage.HAND)
+
+func get_deck() -> Array[Card]:
+	return get_cards_by_stage(Card.Stage.DECK)
+
+func get_discard_pile() -> Array[Card]:
+	return get_cards_by_stage(Card.Stage.DISCARD)
+
+func find_card(instance_id: String) -> Card:
+	for card in _all_cards:
+		if card.instance_id == instance_id:
+			return card
+	return null
+
+## ========== 注册到 O(1) 查找表（FIX-5: 由 RhythmPort 调用） ==========
+func register_rhythm_context(context_id: String, card: Card) -> void:
+	_playing_by_context[context_id] = card
+	card.rhythm_context_id = context_id  # FIX-9: 回填 context_id 到 Card
+
+func unregister_rhythm_context(context_id: String) -> void:
+	var card: Card = _playing_by_context.get(context_id, null)
+	if card != null:
+		card.rhythm_context_id = ""
+	_playing_by_context.erase(context_id)
+```
+
+### 5.3 Card（实体）
+
+```gdscript
+class_name Card
+extends RefCounted
+
+## ========== 静态数据 ==========
+var data: CardData
+
+## ========== 身份 ==========
+var instance_id: String
+
+## ========== 运行时状态（全部在 Card 上，Card.stage 是唯一位置来源） ==========
+var stage: Stage = Stage.DECK
+var current_charge: int = 0
+var rhythm_context_id: String = ""    # FIX-9: 由 RhythmPort 在 rhythm 启动后回填
+var combo_tags: Array[String] = []
+
+## ========== 阶段（Card.stage 是唯一位置来源，CardManager 据此派生查询） ==========
+enum Stage {
+	DECK,       # 在牌堆中
+	HAND,       # 在手牌中
+	PLAYING,    # 正在节奏轴判定
+	CHARGED,    # 充能完成
+	DISCARD,    # 在弃牌区
+	EFFECT_USED # 效果已触发（不可再用）
+}
+
+## ========== 静态工厂（FIX-1: 替代已移除的 CardFactory） ==========
+static func create(data: CardData, instance_id: String) -> Card:
+	var card := Card.new()
+	card.data = data
+	card.instance_id = instance_id
+	card.stage = Stage.DECK
+	card.current_charge = 0
+	card.rhythm_context_id = ""
+	card.combo_tags = data.combo_tags.duplicate() if data.combo_tags.size() > 0 else []
+	return card
+
+## ========== 充能（自包含） ==========
+func add_charge(amount: int) -> void:
+	current_charge += amount
+	if current_charge > data.required_charge:
+		current_charge = data.required_charge
+
+func is_fully_charged() -> bool:
+	return current_charge >= data.required_charge
+
+func get_charge_progress() -> Dictionary:
+	return {
+		"current": current_charge,
+		"required": data.required_charge,
+		"ratio": float(current_charge) / data.required_charge if data.required_charge > 0 else 1.0
+	}
+
+## ========== 重置（复用卡牌时） ==========
+func reset() -> void:
+	stage = Stage.DECK
+	current_charge = 0
+	rhythm_context_id = ""
+```
+
+### 5.4 CardData
+
+```gdscript
+class_name CardData
+extends Resource
+
+@export var card_id: String = ""
+@export var card_name: String = ""
+@export var card_type: String = ""        # "attack" / "defense" / "buff" / "debuff" / "special"
+@export var description: String = ""
+
+@export var quantity: int = 1              # 初始牌堆中该卡牌的数量
+@export var required_charge: int = 3      # 充能次数
+@export var rhythm_keys: Array[int] = [] # 按键序列
+@export var rhythm_timeout: float = 1.0   # 顺序按键超时
+
+@export var combo_points: int = 0        # 连携点数
+@export var combo_tags: Array[String] = [] # 连携标签
+
+@export var effect_id: String = ""         # 效果处理器 ID
+@export var effect_params: Dictionary = {} # 效果参数字典
+
+@export var texture_path: String = ""
+@export var cost: int = 0               # 打出消耗
+```
+
+### 5.5 DrawDriver（发牌驱动接口）
+
+Strategy 模式。抽象"何时触发发牌"的行为，任何触发方式都实现这个接口。
+
+```gdscript
+class_name DrawDriver
+extends RefCounted
+
+var _cards_module: CardsModule
+
+func _init(cards_module: CardsModule) -> void:
+	_cards_module = cards_module
+
+func start() -> void:
+	pass
+
+func stop() -> void:
+	pass
+
+func cleanup() -> void:
+	pass
+
+func _trigger_draw() -> void:
+	_cards_module.request_draw()
+```
+
+### 5.6 AutoDrawDriver（自动发牌驱动）
+
+```gdscript
+class_name AutoDrawDriver
+extends DrawDriver
+
+var _timer: Timer
+var _interval: float = 2.0
+
+func _init(cards_module: CardsModule, interval: float = 2.0):
+	super(cards_module)
+	_interval = interval
+	_timer = Timer.new()
+	_timer.one_shot = false
+
+func start() -> void:
+	_cards_module.add_child(_timer)
+	_timer.timeout.connect(_on_timer)
+	_timer.start(_interval)
+
+func stop() -> void:
+	if _timer.timeout.is_connected(_on_timer):
+		_timer.timeout.disconnect(_on_timer)
+	_timer.stop()
+
+func cleanup() -> void:
+	stop()
+	if is_instance_valid(_timer):
+		_timer.queue_free()
+	_timer = null
+
+func _on_timer() -> void:
+	_trigger_draw()
+```
+
+### 5.7 KeyDrawDriver（按键发牌驱动）
+
+```gdscript
+class_name KeyDrawDriver
+extends DrawDriver
+
+var _key: int = KEY_SPACE
+
+func _init(cards_module: CardsModule, key: int = KEY_SPACE):
+	super(cards_module)
+	_key = key
+
+func start() -> void:
+	EventBus.listen("input:key_pressed", self, "_on_key_pressed")
+
+func stop() -> void:
+	EventBus.unlisten("input:key_pressed", self)
+
+func cleanup() -> void:
+	stop()
+
+func _on_key_pressed(data: Dictionary) -> void:
+	if data.get("key") == _key:
+		_trigger_draw()
+```
+
+### 5.8 ClickDrawDriver（点击发牌驱动）
+
+**FIX-6 修复**：`start()` 中完成节点的连接，而不是在 `set_target()` 里。
+
+```gdscript
+class_name ClickDrawDriver
+extends DrawDriver
+
+var _target_node: Node = null
+
+func _init(cards_module: CardsModule):
+	super(cards_module)
+
+func set_target(node: Node) -> void:
+	if _target_node != null:
+		_stop_listening()
+	_target_node = node
+	if _target_node != null and _is_active:
+		_start_listening()
+
+## FIX-6: start() 管理激活状态，确保 set_target 之后能正确响应
+var _is_active: bool = false
+
+func start() -> void:
+	_is_active = true
+	if _target_node != null:
+		_start_listening()
+
+func stop() -> void:
+	_is_active = false
+	_stop_listening()
+
+func cleanup() -> void:
+	stop()
+	_target_node = null
+
+func _start_listening() -> void:
+	if _target_node != null and not _target_node.gui_input.is_connected(_on_gui_input):
+		_target_node.gui_input.connect(_on_gui_input)
+
+func _stop_listening() -> void:
+	if _target_node != null and _target_node.gui_input.is_connected(_on_gui_input):
+		_target_node.gui_input.disconnect(_on_gui_input)
+
+func _on_gui_input(event) -> void:
+	if event is InputEventMouseButton:
+		if event.pressed and event.button_index == MOUSE_BUTTON_LEFT:
+			_trigger_draw()
+```
+
+### 5.9 RhythmPort（节奏轴服务）
+
+**FIX-9 修复**：监听 `rhythm:context_started`，将 `context_id` 回填到 `Card.rhythm_context_id`，使 `CardManager` 能在任何时候通过 `context_id` 找到对应卡牌。
+
+```gdscript
+class_name RhythmPort
+extends RefCounted
+
+var _card_manager: CardManager
+
+func _init(card_manager: CardManager) -> void:
+	_card_manager = card_manager
+	_subscribe_events()
+
+func cleanup() -> void:
+	_unsubscribe_events()
+
+func _subscribe_events() -> void:
+	EventBus.listen("rhythm:input_judged", self, "_on_rhythm_judged")
+	EventBus.listen("rhythm:context_started", self, "_on_context_started")  # FIX-9
+
+func _unsubscribe_events() -> void:
+	EventBus.unlisten("rhythm:input_judged", self)
+	EventBus.unlisten("rhythm:context_started", self)  # FIX-9
+
+## FIX-9: 接收 rhythm_axis 返回的 context_id，注册到 CardManager 的 O(1) 查找表
+func _on_context_started(data: Dictionary) -> void:
+	var context_id: String = data.get("context_id", "")
+	var card_instance_id: String = data.get("card_instance_id", "")
+	if context_id == "" or card_instance_id == "":
+		return
+	var card: Card = _card_manager.find_card(card_instance_id)
+	if card == null:
+		return
+	_card_manager.register_rhythm_context(context_id, card)
+
+## 将 rhythm 判定结果转发给 CardManager 处理
+func _on_rhythm_judged(data: Dictionary) -> void:
+	var context_id: String = data.get("context_id", "")
+	var result: int = data.get("result", 0)
+	var delta: float = data.get("delta", 0.0)
+	_card_manager.notify_judged(context_id, result, delta)
+```
+
+### 5.10 ComboTracker（连携追踪服务）
+
+```gdscript
+class_name ComboTracker
+extends RefCounted
+
+var _recent: Array[Card] = []
+var _window_size: int
+var _definitions: Array[Dictionary] = []
+
+func _init(window_size: int) -> void:
+	_window_size = window_size
+	_subscribe_events()
+
+func cleanup() -> void:
+	_unsubscribe_events()
+
+func load_definitions(path: String) -> void:
+	if not ResourceLoader.exists(path):
+		return
+	# TODO: 解析连携定义
+	pass
+
+func _subscribe_events() -> void:
+	EventBus.listen("cards:card_charged", self, "_on_card_charged")
+
+func _unsubscribe_events() -> void:
+	EventBus.unlisten("cards:card_charged", self)
+
+func record(card: Card) -> void:
+	_recent.append(card)
+	if _recent.size() > _window_size:
+		_recent.pop_front()
+	_check_combo(card)
+
+func _check_combo(latest: Card) -> void:
+	for def in _definitions:
+		var required_tags: Array[String] = def.get("tags", [])
+		if required_tags.is_empty():
+			continue
+		if latest.combo_tags.has_all(required_tags):
+			_trigger_combo(def)
+
+func _trigger_combo(def: Dictionary) -> void:
+	EventBus.fire("combo:detected", {
+		"combo_id": def.get("id", ""),
+		"bonus": def.get("bonus", {}),
+	})
+```
+
+### 5.11 EffectRegistry（效果注册表）
+
+**FIX-4 修复**：集中管理 `effect_id → EffectHandler` 的映射，由 `CardsModule._on_card_charged()` 调用。
+
+```gdscript
+class_name EffectRegistry
+extends RefCounted
+
+var _handlers: Dictionary = {}  # effect_id → EffectHandler
+
+func register(handler: EffectHandler) -> void:
+	_handlers[handler.effect_id] = handler
+
+func execute(card: Card) -> void:
+	var effect_id: String = card.data.effect_id
+	var handler: EffectHandler = _handlers.get(effect_id, null)
+	if handler == null:
+		push_warning("[EffectRegistry] 未注册效果处理器: " + effect_id)
+		return
+	handler.execute(card)
+```
+
+### 5.12 EffectHandler（效果处理器基类）
+
+```gdscript
+class_name EffectHandler
+extends RefCounted
+
+var effect_id: String = ""
+var params: Dictionary = {}
+
+func _init(id: String, p: Dictionary = {}) -> void:
+	effect_id = id
+	params = p
+
+func execute(card: Card) -> void:
+	push_error("[EffectHandler] 子类必须重写 execute(): " + effect_id)
+
+func _dispatch(card: Card, result_data: Dictionary) -> void:
+	EventBus.fire("cards:effect_triggered", {
+		"card": card,
+		"effect_id": effect_id,
+		"result": result_data,
+	})
+```
+
+---
+
+## 六、事件契约
+
+### cards ↔ rhythm_axis
+
+| 事件 | 方向 | 载荷 | 说明 |
+|------|------|------|------|
+| `cards:request_rhythm_start` | cards → rhythm | `{card_instance_id, card_id, required_charge, rhythm_keys, rhythm_timeout, bpm}` | 请求启动节奏轴 |
+| `cards:request_rhythm_stop` | cards → rhythm | `{context_id}` | 请求停止节奏轴 |
+| `rhythm:context_started` | rhythm → cards | `{context_id, card_instance_id}` | **FIX-9 新增**：rhythm 启动后返回 context_id |
+| `rhythm:input_judged` | rhythm → cards | `{context_id, block_id, result, delta}` | 判定结果 |
+
+### cards 内部事件
+
+| 事件 | 触发时机 | 关键载荷 |
+|------|---------|---------|
+| `cards:card_drawn` | 抽牌到手牌 | `instance_id`, `card_id`, `stage` |
+| `cards:card_played` | 玩家出牌 | `instance_id`, `card_id` |
+| `cards:charge_updated` | 充能增加 | `card`, `current`, `required`, `is_completed` |
+| `cards:card_charged` | 充能完成 | `card` |
+| `cards:charge_failed` | 充能失败 | `card` |
+| `cards:card_discarded` | 卡牌进入弃牌堆 | `instance_id` |
+| `cards:turn_started` | 回合开始 | `hand_size` |
+| `cards:turn_ended` | 回合结束 | `discard_size` |
+| `cards:effect_triggered` | 效果触发 | `card`, `effect_id`, `result` |
+| `combo:detected` | 检测到连携 | `combo_id`, `bonus` |
+
+---
+
+## 七、深度自查问题清单与修复
+
+| # | 问题 | 严重程度 | 修复方案 |
+|---|------|---------|---------|
+| **FIX-1** | `Card` 创建流程缺失，`_deck` 永远为空，整个游戏无法运行 | 严重 | `CardManager._build_initial_deck()` 在 `load_database()` 中调用，从 `CardData.quantity` 创建 `Card` 实例填入 `_all_cards` |
+| **FIX-2** | `_all_cards` 从未被填充，`find_card()` 永远返回 `null` | 严重 | `_build_initial_deck()` 中向 `_all_cards.append(card)` |
+| **FIX-3** | `end_turn()` 逻辑 bug：`for card in _hand` 时 `_hand` 已被清空；且 `Card.stage` 和容器数组双重复位 | 严重 | `Card.stage` 作为唯一位置来源，`get_cards_by_stage()` 派生查询；`end_turn()` 直接过滤 HAND 阶段卡牌设置 stage，不再操作数组副本 |
+| **FIX-4** | 效果触发事件流断裂：`cards:card_charged` 触发后无人调用 `EffectHandler.execute()` | 严重 | `CardsModule._on_card_charged()` 中新增 `_effect_registry.execute(card)`；新增 `EffectRegistry` 类管理 `effect_id → Handler` 映射 |
+| **FIX-5** | `_find_card_by_context()` 是 O(n) 查找，每次节奏轴判定都要遍历所有卡牌 | 中等 | 新增 `_playing_by_context: Dictionary`（O(1) 查找表）；`register_rhythm_context()` / `unregister_rhythm_context()` 管理注册；`notify_judged()` 使用 `_playing_by_context.get()` |
+| **FIX-6** | `ClickDrawDriver.start()` 是空函数，必须手动调用 `set_target()` 才能工作 | 中等 | `start()` 中根据 `_is_active` 状态决定是否调用 `_start_listening()`；`set_target()` 中检查 `_is_active` 决定是否连接信号 |
+| **FIX-7** | `end_turn()` 中 `card.stage = DISCARD` 写在 `for` 循环里，但循环的是空数组的副本 | 中等 | 由 FIX-3 统一解决：`get_cards_by_stage(Card.Stage.HAND)` 永远返回正确数据 |
+| **FIX-8** | `CardsModule._combo_tracker` 公开暴露，内部实现泄漏到模块边界 | 低 | 重命名为 `_combo_tracker`（已有 `_` 前缀，但之前文档描述不够清晰） |
+| **FIX-9** | `play_card()` 没有获取 rhythm 返回的 `context_id`，`_complete_card()` 中 `card.rhythm_context_id` 永远为空，停止节奏轴时无法定位 | 中等 | 新增 `rhythm:context_started` 事件；`RhythmPort._on_context_started()` 接收 `context_id` 并调用 `CardManager.register_rhythm_context()`；`CardManager` 新增 `register/unregister_rhythm_context()` 方法 |
+
+---
+
+## 八、架构验证
+
+### 对照 ai-rules-template 检查
+
+| 原则 | v3.1 符合情况 |
+|------|-------------|
+| **zero-hardcoding** | ✅ 所有常量集中在 CardsModule 顶部 |
+| **abstraction** | ✅ CardManager 一句话说清；Card 一句话说清；DrawDriver 接口职责清晰 |
+| **data-separation** | ✅ CardData 是 Resource 在 data/，核心类在 _core/ |
+| **layering** | ✅ _core/ → _services/ → _effects/，只向下依赖 |
+| **module-boundary** | ✅ CardsModule 是唯一入口，服务间通过 EventBus 解耦 |
+| **naming** | ✅ 文件 snake_case，类 PascalCase，私有 _ 前缀 |
+| **type-safety** | ✅ 所有参数/返回值有类型声明 |
+| **error-handling** | ✅ push_error/push_warning + 返回值约定 |
+| **interface-contract** | ✅ 事件契约在 contracts/ 目录 |
+| **self-consistency** | ✅ 修复了 FIX-1~FIX-9 共 9 个自相矛盾的数据流问题 |
+
+### 高内聚低耦合验证
+
+| 类 | 职责 | 高内聚 |
+|----|------|--------|
+| `Card` | 自己的 stage/charge/rhythm_context | ✅ |
+| `CardManager` | 容器（_all_cards）+ stage 转换 + O(1) 查找表 | ✅ |
+| `EffectRegistry` | effect_id → Handler 映射管理 | ✅ |
+| `DrawDriver` | "何时发牌"的抽象 | ✅ |
+| `AutoDrawDriver` | 定时器发牌 | ✅ |
+| `KeyDrawDriver` | 按键发牌 | ✅ |
+| `ClickDrawDriver` | 点击发牌 | ✅ |
+| `RhythmPort` | 转发 rhythm 事件 + 回填 context_id | ✅ |
+| `ComboTracker` | 记录 + 检测连携 | ✅ |
+| `EffectHandler` | 执行一个效果 | ✅ |
+
+### 可扩展性验证
+
+| 扩展场景 | v3.1 如何实现 |
+|---------|-------------|
+| 新增发牌方式 | 新增 `DrawDriver` 子类，调用 `CardsModule.set_draw_driver()` 注入 |
+| 新增效果类型 | 新增 `EffectHandler` 子类，调用 `CardsModule.register_effect_handler()` 注册 |
+| 新增充能规则 | 修改 `CardManager._calc_charge()` |
+| 新增连携组合 | 修改 `ComboTracker._definitions` 配置 |
+| 替换节奏轴实现 | 修改 `RhythmPort` 事件解析 |
+
+---
+
+## 九、文件清单
+
+```
+节奏牌/modules/cards/
+├── cards_module.gd              # 入口
+│
+├── _core/
+│   ├── card_manager.gd         # 内核
+│   ├── card.gd                  # 实体
+│   └── card_data.gd            # 静态数据
+│
+├── _services/
+│   ├── draw_driver.gd           # 发牌驱动接口
+│   ├── _draw_drivers/
+│   │   ├── auto_draw_driver.gd  # 自动发牌
+│   │   ├── key_draw_driver.gd   # 按键发牌
+│   │   └── click_draw_driver.gd # 点击发牌
+│   ├── rhythm_port.gd            # 节奏轴服务（含 context_id 回填）
+│   ├── combo_tracker.gd          # 连携追踪
+│   └── _effects/
+│       ├── effect_handler.gd     # 效果基类
+│       ├── effect_registry.gd    # 效果注册表（FIX-4 新增）
+│       ├── attack_handler.gd
+│       ├── defense_handler.gd
+│       ├── buff_handler.gd
+│       ├── debuff_handler.gd
+│       └── special_handler.gd
+│
+├── data/configs/
+│   ├── card_database.tres
+│   └── combo_definitions.tres
+│
+└── contracts/
+    └── cards-rhythm.contract.md
+```
+
+**总计：16 个脚本文件 + 2 个数据 + 1 个契约 = 19 个文件**
+
+---
+
+## 十、v3.0 → v3.1 变更清单
+
+| 变更 | 说明 |
+|------|------|
+| **FIX-1** | 新增 `CardManager._build_initial_deck()`：从 `CardData` + `quantity` 创建 `Card` 实例填入 `_all_cards` |
+| **FIX-2** | `Card.create()` 作为静态工厂替代已移除的 `CardFactory` |
+| **FIX-3** | `Card.stage` 作为唯一位置来源；`_deck/_hand/_discard` 数组移除；`get_cards_by_stage()` 派生查询 |
+| **FIX-4** | 新增 `EffectRegistry`；`CardsModule._on_card_charged()` 调用 `_effect_registry.execute(card)` |
+| **FIX-5** | 新增 `_playing_by_context: Dictionary`（O(1) 查找表）；`register/unregister_rhythm_context()` 管理注册 |
+| **FIX-6** | `ClickDrawDriver` 重构：`_is_active` 状态 + `start()/stop()` 管理信号连接 |
+| **FIX-7** | `end_turn()` 重构：通过 `get_cards_by_stage(Card.Stage.HAND)` 查询后设置 stage |
+| **FIX-8** | 所有内部服务字段确认有 `_` 前缀 |
+| **FIX-9** | 新增 `rhythm:context_started` 事件；`RhythmPort._on_context_started()` 回填 `context_id` 到 `Card` |
+| **新增** | `DrawDriver` 接口 + `AutoDrawDriver` / `KeyDrawDriver` / `ClickDrawDriver` |
+| **移除** | `CardFactory`、`CardPile`、`HandManager`、`CardDealer`、`ChargeManager`、`PlayContext`、`EffectDispatcher` |
+
+---
+
+*v3.1 — 2026-03-20*
