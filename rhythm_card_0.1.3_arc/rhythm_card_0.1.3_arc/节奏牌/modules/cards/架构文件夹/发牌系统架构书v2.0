@@ -1,0 +1,992 @@
+# 发牌系统架构书 v2.0
+
+> 版本: 2.0
+> 更新日期: 2026-03-17
+> 基于: ai-rules-template 开发准则
+
+---
+
+## 一.总开发思想
+
+1.所有模块的开发都要遵循ai-rules-template文件夹内的开发指南
+2.模块间要保证高内聚，低耦合的特性
+3.所有模块间不能采用直接调用，通过EventBus事件总线通信
+4.遵循设计模式原则：单一职责、开闭原则、依赖倒置、接口隔离
+
+---
+
+## 二.项目说明
+
+### 2.1 项目背景
+
+本项目是基于Godot开发的音游卡牌系统。核心玩法：玩家通过打出手牌触发节奏轴判定，判定成功累积充能，充能完成后产生效果。
+
+### 2.2 核心概念
+
+| 概念 | 定义 |
+|------|------|
+| **回合** | 一轮游戏中，当玩家所有手牌打完，或者时间耗尽，算一个回合结束 |
+| **充能** | 卡牌需要通过节奏轴判定成功来累积充能点数，不同卡牌需要不同次数的判定成功 |
+| **连携** | 当多张卡牌按特定组合顺序全部充能完成时，触发额外的连携效果 |
+| **出牌上下文** | 每张卡牌出牌时创建的独立上下文，管理该卡的完整生命周期 |
+
+### 2.3 设计原则
+
+本架构遵循以下核心设计原则：
+
+1. **单一职责原则(SRP)** - 每个类/模块只负责一件事
+2. **依赖倒置原则(DIP)** - 依赖抽象接口，不依赖具体实现
+3. **开闭原则(OCP)** - 对扩展开放，对修改封闭
+4. **接口隔离原则(ISP)** - 多个专用接口优于一个通用接口
+
+### 2.4 项目细节
+
+1. **发牌器**
+   - 职责：从卡牌数据库随机抽取N张牌到发牌区，然后通过驱动方式发到玩家手牌区
+   - 驱动方式：点击发牌器/敲击按键/外部事件（做成DealingDriver接口）
+   - 抽牌时机：发牌区为空时自动从牌堆抽牌
+
+2. **卡牌流转（发牌区→手牌区→弃牌区循环）**
+   - 发牌区(Draw Pile)：暂时存放从牌堆抽取的卡牌
+   - 手牌区(Hand)：玩家持有的卡牌
+   - 弃牌区(Discard Pile)：效果已触发的卡牌存放区域
+   - 循环机制：当发牌区为空时，弃牌区洗牌回牌堆
+
+3. **卡牌系统与节奏轴系统联动**
+   - 出牌：玩家选择卡牌打出
+   - 创建PlayContext：为该卡牌创建独立的出牌上下文
+   - RhythmAdapter：适配节奏轴，创建/管理节奏轴实例
+   - 充能：节奏轴判定成功 → RhythmAdapter接收 → ChargeMediator处理
+   - 效果触发：充能完成后自动触发卡牌效果
+
+4. **连携机制**
+   - 定义：特定组合的卡牌按顺序全部充能完成后触发的额外效果
+   - 触发条件：组合内所有卡牌都达到完全充能状态
+
+5. **回合流程**
+   - 回合开始 → 发牌阶段 → 玩家出牌阶段 → (循环)出牌→判定→充能→效果 → 回合结束
+
+---
+
+## 三.优化后的项目结构
+
+### 3.1 核心改进
+
+相比v1.0版本的改进：
+
+| 问题 | v1.0设计 | v2.0优化 |
+|------|----------|----------|
+| CardData职责混乱 | 混合静态数据+运行时状态 | 分离为CardData+CardInstance |
+| ChargeSystem职责过重 | 管理充能+接收判定+触发效果 | 拆分为RhythmAdapter+ChargeMediator |
+| PlayOrderManager紧耦合 | 直接被ChargeSystem调用 | 通过PlayContext管理生命周期 |
+| 节奏轴上下文丢失 | 不知道为哪张卡牌服务 | 每个PlayContext持有独立的rhythm_context |
+| 阶段状态不清晰 | 缺少明确的阶段划分 | 引入PlayPhase状态机 |
+
+### 3.2 模块目录结构
+
+```
+节奏牌/modules/cards/
+├── cards_module.gd                    # 模块唯一公共入口 (class_name: CardsModule)
+├── STATUS.md
+├── CHANGELOG.md
+├── data/
+│   └── configs/                       # 数据与代码分离
+│       ├── card_database.tres         # 卡牌静态数据配置
+│       └── card_effects.tres           # 卡牌效果配置
+├── scripts/
+│   ├── _core/                         # 核心组件（内部实现）
+│   │   ├── card_factory.gd            # 卡牌工厂（创建CardInstance）
+│   │   ├── card_data.gd               # 卡牌静态数据类
+│   │   └── card_instance.gd           # 卡牌实例类（运行时状态）
+│   │
+│   ├── deck/                          # 牌堆子系统
+│   │   ├── card_deck.gd              # 牌堆管理器
+│   │   └── deck_interface.gd         # 牌堆接口（抽象）
+│   │
+│   ├── hand/                          # 手牌子系统
+│   │   ├── hand_area.gd              # 手牌区管理
+│   │   └── hand_interface.gd         # 手牌区接口（抽象）
+│   │
+│   ├── discard/                       # 弃牌子系统
+│   │   ├── discard_pile.gd          # 弃牌区管理
+│   │   └── discard_interface.gd     # 弃牌区接口（抽象）
+│   │
+│   ├── dealing/                       # 发牌子系统
+│   │   ├── card_dealer.gd           # 发牌器
+│   │   └── dealing_driver.gd         # 发牌驱动接口（可替换）
+│   │
+│   ├── play_phase/                    # 出牌阶段子系统
+│   │   ├── play_phase_manager.gd    # 出牌阶段管理器（状态机）
+│   │   ├── play_context.gd          # 出牌上下文（核心概念）
+│   │   ├── play_phase_state.gd      # 阶段状态基类
+│   │   └── states/
+│   │       ├── phase_waiting.gd     # 等待出牌阶段
+│   │       ├── phase_rhythm.gd      # 节奏轴运行阶段
+│   │       └── phase_charged.gd     # 充能完成阶段
+│   │
+│   ├── rhythm_adapter/                 # 节奏轴适配器子系统，相当于一个翻译官，把节奏周的判定结果转换成卡牌系统的指令
+│   │   ├── rhythm_adapter.gd        # 节奏轴适配器（核心接口）
+│   │   ├── rhythm_context.gd        # 节奏轴上下文
+│   │   └── rhythm_adapter_impl.gd   # 具体适配实现
+│   │
+│   ├── charge/                        # 充能子系统
+│   │   ├── charge_mediator.gd       # 充能协调器（核心）
+│   │   ├── charge_calculator.gd     # 充能计算器（接口）
+│   │   ├── charge_interface.gd      # 充能策略接口（可替换）
+│   │   └── charge_rules/
+│   │       ├── standard_charge.gd   # 标准充能规则
+│   │       └── combo_charge.gd      # 连携充能规则
+│   │
+│   ├── combo/                         # 连携子系统
+│   │   ├── combo_detector.gd        # 连携检测器
+│   │   ├── combo_checker.gd         # 连携检测器接口（可替换）
+│   │   └── combo_bonus.gd           # 连携加成计算
+│   │
+│   └── effects/                       # 效果子系统
+│       ├── card_effect.gd            # 卡牌效果基类
+│       ├── effect_trigger.gd         # 效果触发器
+│       └── effect_interface.gd       # 效果接口（可替换）
+│
+├── contracts/                         # 接口契约
+│   └── cards_rhythm_axis.contract.md # cards ↔ rhythm_axis 契约
+│
+├── scenes/
+│   ├── test/
+│   │   └── test_cards.tscn
+│   └── cards_table.tscn
+│
+└── 架构文件夹/
+    ├── 发牌系统架构书 v2.0           # 本文档
+    └── 架构图.jpg
+
+节奏牌/core/
+└── EventBus.gd                       # 事件总线
+```
+
+---
+
+## 四.核心类设计
+
+### 4.1 CardsModule (模块入口)
+
+> 遵循 module-boundary 规范：模块主文件作为唯一公共入口
+
+```gdscript
+class_name CardsModule
+extends Node
+
+## 公共接口
+func initialize() -> void:
+    """初始化模块，创建所有子系统"""
+
+func cleanup() -> void:
+    """清理资源（与initialize对称）"""
+
+func start_turn() -> void:
+    """开始一回合"""
+
+func end_turn() -> void:
+    """结束当前回合"""
+
+## 获取子系统（通过接口，不暴露内部实现）
+func get_deck() -> DeckInterface:
+    pass
+
+func get_hand_area() -> HandInterface:
+    pass
+
+func get_discard_pile() -> DiscardInterface:
+    pass
+
+func get_phase_manager() -> PlayPhaseManager:
+    pass
+```
+
+### 4.2 CardData (卡牌静态数据)
+
+> 纯数据类，只包含静态配置信息
+
+```gdscript
+class_name CardData
+extends Resource
+
+## 静态属性（从.tres配置加载）
+@export var card_id: int
+@export var card_name: String
+@export var card_type: String           # "attack", "defense", "buff", etc.
+@export var required_charge: int = 3    # 所需充能次数
+@export var combo_points: int = 0       # 连携点数
+@export var effect_id: int              # 效果ID
+@export var effect_config: Dictionary   # 效果配置参数
+@export var texture_path: String        # 卡牌图片路径
+
+## 可选属性
+@export var description: String = ""    # 卡牌描述
+@export var cost: int = 0               # 打出消耗（未来扩展）
+@export var combo_tags: Array[String] = []  # 连携标签，用于检测连携组合
+```
+
+### 4.3 CardInstance (卡牌实例)
+
+> 运行时对象，管理单张卡牌的动态状态
+
+```gdscript
+class_name CardInstance
+extends RefCounted
+
+## 引用
+var card_data: CardData
+
+## 运行时状态
+var instance_id: int                    # 实例唯一ID
+var current_charge: int = 0             # 当前充能点
+var current_state: CardState            # 当前状态
+var play_context: PlayContext = null    # 所属的出牌上下文
+
+## 状态枚举
+enum CardState {
+    IN_DECK,        # 在牌堆中
+    IN_DRAW_PILE,   # 在发牌区
+    IN_HAND,        # 在手牌区
+    PLAYING,        # 正在判定/充能中
+    CHARGED,        # 充能完成
+    IN_DISCARD,     # 在弃牌区
+    EFFECT_USED     # 效果已触发
+}
+
+## 方法
+func reset() -> void:
+    """重置为初始状态（从弃牌堆回收时调用）"""
+    current_charge = 0
+    current_state = CardState.IN_DECK
+    play_context = null
+
+func add_charge(amount: int) -> void:
+    """增加充能点"""
+    current_charge += amount
+
+func is_fully_charged() -> bool:
+    """是否已完全充能"""
+    return current_charge >= card_data.required_charge
+
+func get_charge_progress() -> Dictionary:
+    """获取充能进度"""
+    return {
+        "current": current_charge,
+        "required": card_data.required_charge,
+        "progress": float(current_charge) / card_data.required_charge if card_data.required_charge > 0 else 1.0
+    }
+```
+
+### 4.4 CardFactory (卡牌工厂)
+
+> 遵循工厂模式和依赖注入原则
+
+```gdscript
+class_name CardFactory
+extends RefCounted
+
+var _card_data_cache: Dictionary = {}  # card_id -> CardData
+
+## 创建卡牌实例
+func create_instance(card_id: int) -> CardInstance:
+    var card_data = get_card_data(card_id)
+    var instance = CardInstance.new()
+    instance.card_data = card_data
+    instance.instance_id = _generate_instance_id()
+    instance.current_state = CardInstance.CardState.IN_DECK
+    return instance
+
+## 批量创建
+func create_instances(card_ids: Array[int]) -> Array[CardInstance]:
+    var instances: Array[CardInstance] = []
+    for card_id in card_ids:
+        instances.append(create_instance(card_id))
+    return instances
+
+## 获取卡牌数据（带缓存）
+func get_card_data(card_id: int) -> CardData:
+    if not _card_data_cache.has(card_id):
+        var path = CARD_DATA_DIR_PATH + str(card_id) + ".tres"
+        _card_data_cache[card_id] = load(path)
+    return _card_data_cache[card_id]
+
+func _generate_instance_id() -> int:
+    _instance_counter += 1
+    return _instance_counter
+```
+
+### 4.5 PlayContext (出牌上下文) - 核心概念
+
+> 这是v2.0最重要的改进：为每张出牌创建独立的上下文
+
+```gdscript
+class_name PlayContext
+extends RefCounted
+
+## 上下文唯一标识
+var context_id: int
+
+## 关联的卡牌实例
+var card_instance: CardInstance
+
+## 节奏轴上下文（为这张卡牌创建的节奏轴实例）
+var rhythm_context: RhythmContext
+
+## 充能状态
+var charge_state: ChargeState
+enum ChargeState {
+    IDLE,           # 未开始
+    CHARGING,       # 充能中
+    COMPLETED,      # 充能完成
+    FAILED          # 充能失败（如Miss次数过多）
+}
+
+## 生命周期回调（使用Callable，便于解耦）
+var on_charge_updated: Callable          # 充能更新时回调
+var on_charge_completed: Callable         # 充能完成时回调
+var on_charge_failed: Callable            # 充能失败时回调
+var on_effect_triggered: Callable          # 效果触发时回调
+
+## 方法
+func start_charging() -> void:
+    """开始充能流程"""
+    charge_state = ChargeState.CHARGING
+    card_instance.current_state = CardInstance.CardState.PLAYING
+
+func add_charge(amount: int) -> Dictionary:
+    """增加充能，返回结果"""
+    card_instance.add_charge(amount)
+    return {
+        "context_id": context_id,
+        "card_id": card_instance.card_data.card_id,
+        "current": card_instance.current_charge,
+        "required": card_instance.card_data.required_charge,
+        "is_completed": card_instance.is_fully_charged()
+    }
+
+func complete_charging() -> void:
+    """完成充能"""
+    charge_state = ChargeState.COMPLETED
+    card_instance.current_state = CardInstance.CardState.CHARGED
+
+func fail_charging() -> void:
+    """充能失败"""
+    charge_state = ChargeState.FAILED
+
+func cleanup() -> void:
+    """清理上下文"""
+    if rhythm_context != null:
+        rhythm_context.cleanup()
+    card_instance.current_state = CardInstance.CardState.IN_DISCARD
+```
+
+### 4.6 PlayPhaseManager (出牌阶段管理器)
+
+> 使用状态机模式管理出牌流程
+
+```gdscript
+class_name PlayPhaseManager
+extends RefCounted
+
+## 当前阶段
+var current_phase: PlayPhaseState
+var _phase_factory: PhaseStateFactory
+
+## 活跃的出牌上下文
+var _active_contexts: Array[PlayContext] = []
+
+## 公共接口
+func play_card(card_instance: CardInstance) -> PlayContext:
+    """玩家打出一张卡牌，创建PlayContext"""
+    var context = _create_context(card_instance)
+    _active_contexts.append(context)
+    _transition_to(PlayPhase.PLAYING)
+    return context
+
+func cancel_play(context_id: int) -> void:
+    """取消出牌"""
+    _remove_context(context_id)
+
+func get_active_context() -> PlayContext:
+    """获取当前活跃的上下文（如果有）"""
+    if _active_contexts.is_empty():
+        return null
+    return _active_contexts.back()
+
+func cleanup_all() -> void:
+    """清理所有上下文"""
+    for context in _active_contexts:
+        context.cleanup()
+    _active_contexts.clear()
+```
+
+### 4.7 RhythmAdapter (节奏轴适配器) - 核心接口
+
+> 遵循依赖倒置原则：定义抽象接口，便于替换节奏轴实现
+
+```gdscript
+class_name RhythmAdapter
+extends RefCounted
+
+## 节奏轴上下文
+var rhythm_context: RhythmContext
+
+## 公共接口
+func start_rhythm(required_charge: int, config: Dictionary) -> void:
+    """启动节奏轴"""
+    pass
+
+func stop_rhythm() -> void:
+    """停止节奏轴"""
+    pass
+
+func pause_rhythm() -> void:
+    """暂停节奏轴"""
+    pass
+
+func resume_rhythm() -> void:
+    """恢复节奏轴"""
+    pass
+
+func is_running() -> bool:
+    """是否正在运行"""
+    pass
+
+## 回调设置
+func set_on_judged(callback: Callable) -> void:
+    """设置判定结果回调"""
+    pass
+
+func set_on_completed(callback: Callable) -> void:
+    """设置完成回调"""
+    pass
+
+func set_on_failed(callback: Callable) -> void:
+    """设置失败回调"""
+    pass
+```
+
+### 4.8 RhythmAdapterImpl (节奏轴适配器实现)
+
+> 具体实现，封装与RhythmAxisModule的交互
+
+```gdscript
+class_name RhythmAdapterImpl
+extends RhythmAdapter
+
+var _rhythm_module: RhythmAxisModule
+var _on_judged: Callable
+var _on_completed: Callable
+var _on_failed: Callable
+
+func _init(rhythm_module: RhythmAxisModule) -> void:
+    _rhythm_module = rhythm_module
+
+func start_rhythm(required_charge: int, config: Dictionary) -> void:
+    # 订阅事件
+    EventBus.listen("rhythm:input_judged", self, "_on_rhythm_judged")
+    EventBus.listen("rhythm:sequence_completed", self, "_on_sequence_completed")
+    
+    # 通知rhythm_axis启动
+    EventBus.fire("cards:request_rhythm_start", {
+        "required_charge": required_charge,
+        "bpm": config.get("bpm", 120.0),
+        "card_config": config
+    })
+
+func stop_rhythm() -> void:
+    EventBus.unlisten("rhythm:input_judged", self)
+    EventBus.unlisten("rhythm:sequence_completed", self)
+    EventBus.fire("cards:request_rhythm_stop", {})
+
+func _on_rhythm_judged(data: Dictionary) -> void:
+    if _on_judged.is_valid():
+        _on_judged.call(data)
+
+func _on_sequence_completed(data: Dictionary) -> void:
+    if _on_completed.is_valid():
+        _on_completed.call(data)
+```
+
+### 4.9 ChargeMediator (充能协调器) - 核心
+
+> v2.0核心改进：充能逻辑集中管理，解耦所有相关组件
+
+```gdscript
+class_name ChargeMediator
+extends RefCounted
+
+## 依赖注入（通过接口，不依赖具体实现）
+var _charge_calculator: ChargeCalculator       # 充能计算策略
+var _rhythm_adapter: RhythmAdapter             # 节奏轴适配器
+var _effect_trigger: EffectTrigger              # 效果触发器
+
+## 状态
+var _current_context: PlayContext = null        # 当前活跃的出牌上下文
+var _charge_history: Array[Dictionary] = []    # 充能历史（用于分析）
+
+## 公共接口
+func set_charge_calculator(calculator: ChargeCalculator) -> void:
+    _charge_calculator = calculator
+
+func set_rhythm_adapter(adapter: RhythmAdapter) -> void:
+    _rhythm_adapter = adapter
+    _setup_rhythm_callbacks()
+
+func start_charging(context: PlayContext) -> void:
+    """开始为某个PlayContext充能"""
+    _current_context = context
+    context.start_charging()
+    
+    # 启动节奏轴
+    _rhythm_adapter.start_rhythm(
+        context.card_instance.card_data.required_charge,
+        {}
+    )
+
+func _setup_rhythm_callbacks() -> void:
+    _rhythm_adapter.set_on_judged(Callable(self, "_on_judged"))
+    _rhythm_adapter.set_on_completed(Callable(self, "_on_charging_completed"))
+    _rhythm_adapter.set_on_failed(Callable(self, "_on_charging_failed"))
+
+func _on_judged(judge_data: Dictionary) -> void:
+    """处理判定结果"""
+    if _current_context == null:
+        return
+    
+    var result: int = judge_data.get("result", JUDGE_RESULT.MISS)
+    var delta: float = judge_data.get("delta", 0.0)
+    
+    # 使用策略计算充能
+    var charge_amount = _charge_calculator.calculate(result, delta, _current_context)
+    
+    # 更新上下文
+    var charge_result = _current_context.add_charge(charge_amount)
+    
+    # 记录历史
+    _charge_history.append({
+        "context_id": _current_context.context_id,
+        "judge_result": result,
+        "charge_added": charge_amount,
+        "total_charge": charge_result.current
+    })
+    
+    # 发送事件
+    EventBus.fire("cards:charge_updated", charge_result)
+    
+    # 检查是否完成
+    if charge_result.is_completed:
+        _on_charging_completed({})
+
+func _on_charging_completed(_data: Dictionary) -> void:
+    """充能完成"""
+    if _current_context == null:
+        return
+    
+    _current_context.complete_charging()
+    _rhythm_adapter.stop_rhythm()
+    
+    # 触发效果
+    _effect_trigger.trigger(_current_context.card_instance)
+    
+    # 重置上下文
+    _current_context = null
+
+func _on_charging_failed(_data: Dictionary) -> void:
+    """充能失败"""
+    if _current_context == null:
+        return
+    
+    _current_context.fail_charging()
+    _rhythm_adapter.stop_rhythm()
+    _current_context = null
+```
+
+### 4.10 ChargeCalculator (充能计算器接口)
+
+> 抽象接口，允许不同的充能规则
+
+```gdscript
+class_name ChargeCalculator
+extends RefCounted
+
+## 计算单次判定应增加的充能点
+## judge_result: 判定结果
+## delta: 时间差
+## context: 出牌上下文
+## 返回: 增加的充能点数
+func calculate(judge_result: int, delta: float, context: PlayContext) -> int:
+    pass
+
+## 检查是否应该失败充能（Miss次数过多等）
+func should_fail(context: PlayContext) -> bool:
+    pass
+```
+
+### 4.11 StandardCharge (标准充能规则)
+
+> 默认充能规则实现
+
+```gdscript
+class_name StandardCharge
+extends ChargeCalculator
+
+func calculate(judge_result: int, delta: float, context: PlayContext) -> int:
+    match judge_result:
+        JUDGE_RESULT.PERFECT:
+            return 1
+        JUDGE_RESULT.GOOD:
+            return 1
+        JUDGE_RESULT.MISS:
+            return 0
+        _:
+            return 0
+
+func should_fail(context: PlayContext) -> bool:
+    # Miss超过3次，判定失败
+    var miss_count = 0
+    for record in ChargeMediator.charge_history:
+        if record.context_id == context.context_id and record.judge_result == JUDGE_RESULT.MISS:
+            miss_count += 1
+    return miss_count >= 3
+```
+
+### 4.12 ComboDetector (连携检测器)
+
+```gdscript
+class_name ComboDetector
+extends RefCounted
+
+## 最近的完全充能卡牌（用于检测连携）
+var _recent_charged: Array[CardInstance] = []
+const MAX_RECENT_COUNT: int = 5
+
+## 连携配置
+var _combo_definitions: Array[Dictionary] = []
+
+## 检测是否有卡牌完全充能
+func on_card_charged(card_instance: CardInstance) -> void:
+    _recent_charged.append(card_instance)
+    if _recent_charged.size() > MAX_RECENT_COUNT:
+        _recent_charged.pop_front()
+    
+    # 检测连携
+    _check_combo(card_instance)
+
+func _check_combo(new_card: CardInstance) -> void:
+    # 遍历所有连携定义
+    for combo_def in _combo_definitions:
+        if _match_combo(combo_def, new_card):
+            _trigger_combo(combo_def)
+
+func _match_combo(combo_def: Dictionary, latest_card: CardInstance) -> bool:
+    var required_tags = combo_def.get("tags", [])
+    if not latest_card.card_data.combo_tags.has_all(required_tags):
+        return false
+    
+    # 检查是否在有效窗口内
+    # ... 具体实现
+    return true
+
+func _trigger_combo(combo_def: Dictionary) -> void:
+    EventBus.fire("cards:combo_triggered", {
+        "combo_id": combo_def.get("id"),
+        "bonus": combo_def.get("bonus", {})
+    })
+```
+
+### 4.13 EffectTrigger (效果触发器)
+
+```gdscript
+class_name EffectTrigger
+extends RefCounted
+
+## 效果注册表
+var _effect_registry: Dictionary = {}  # effect_id -> EffectHandler
+
+## 注册效果处理器
+func register(effect_id: int, handler: CardEffect) -> void:
+    _effect_registry[effect_id] = handler
+
+## 触发效果
+func trigger(card_instance: CardInstance) -> void:
+    var effect_id = card_instance.card_data.effect_id
+    if _effect_registry.has(effect_id):
+        var handler = _effect_registry[effect_id]
+        handler.execute(card_instance)
+    else:
+        push_warning("[EffectTrigger] 未注册效果处理器: " + str(effect_id))
+```
+
+---
+
+## 五.接口契约 (cards ↔ rhythm_axis)
+
+### 5.1 事件契约
+
+#### rhythm:input_judged (由rhythm_axis发布，cards接收)
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| block_id | String | 节奏块ID |
+| result | int | 判定结果: 0=NONE, 1=PERFECT, 2=GOOD, 3=MISS |
+| delta | float | 时间差(秒) |
+
+#### cards:request_rhythm_start (由cards发布，rhythm_axis接收)
+
+| 字段 | 类型 | 说明 |
+|------|------|------|
+| required_charge | int | 所需充能次数 |
+| bpm | float | 节奏速度 |
+| card_config | Dictionary | 卡牌特定配置 |
+
+#### cards:request_rhythm_stop (由cards发布，rhythm_axis接收)
+
+空载荷，表示停止当前节奏轴。
+
+### 5.2 共享类型
+
+```gdscript
+# 判定结果枚举
+enum JUDGE_RESULT {
+    NONE = 0,
+    PERFECT = 1,
+    GOOD = 2,
+    MISS = 3
+}
+```
+
+---
+
+## 六.模块依赖关系
+
+```
+CardsModule (协调者)
+    │
+    ├──► CardDeck
+    │       └──► CardFactory
+    │               ├──► CardData (Resource)
+    │               └──► CardInstance
+    │
+    ├──► HandArea
+    │
+    ├──► DiscardPile
+    │
+    ├──► PlayPhaseManager
+    │       └──► PlayContext
+    │               ├──► CardInstance
+    │               ├──► RhythmContext
+    │               └──► ChargeMediator
+    │                       │
+    │                       ├──► RhythmAdapter (接口)
+    │                       │       └──► RhythmAdapterImpl
+    │                       │
+    │                       ├──► ChargeCalculator (接口)
+    │                       │       └──► StandardCharge
+    │                       │
+    │                       └──► EffectTrigger
+    │                               └──► CardEffect
+    │
+    ├──► ComboDetector
+    │       └──► ComboChecker (接口)
+    │
+    └──► DealingDriver (接口)
+            ├──► ClickDriver
+            ├──► KeyPressDriver
+            └──► EventDriver
+```
+
+---
+
+## 七.数据流
+
+### 7.1 出牌流程
+
+```
+[玩家点击手牌]
+        │
+        ▼
+PlayPhaseManager.play_card(card_instance)
+        │
+        ▼
+创建 PlayContext (context_id, card_instance, rhythm_context)
+        │
+        ▼
+ChargeMediator.start_charging(context)
+        │
+        ├──► PlayContext.start_charging()
+        │
+        └──► RhythmAdapter.start_rhythm(required_charge, config)
+                │
+                ▼
+        EventBus.fire("cards:request_rhythm_start", {...})
+                │
+                ▼
+        RhythmAxisModule 开始运行...
+                │
+                ▼
+        每次判定成功:
+        EventBus.fire("rhythm:input_judged", {result, delta, ...})
+                │
+                ▼
+        ChargeMediator._on_judged()
+                │
+                ├──► ChargeCalculator.calculate(result, delta, context)
+                ├──► PlayContext.add_charge(amount)
+                ├──► EventBus.fire("cards:charge_updated", {...})
+                │
+                └──► if is_completed:
+                            │
+                            ▼
+                    ChargeMediator._on_charging_completed()
+                            │
+                            ├──► PlayContext.complete_charging()
+                            ├──► RhythmAdapter.stop_rhythm()
+                            ├──► EffectTrigger.trigger(card_instance)
+                            └──► EventBus.fire("cards:card_charged", {...})
+
+[效果触发]
+EffectTrigger.trigger(card_instance)
+        │
+        ▼
+CardEffect.execute(effect_id, card_instance)
+        │
+        ▼
+EventBus.fire("cards:effect_triggered", {...})
+        │
+        ▼
+PlayContext.cleanup()
+        │
+        ▼
+DiscardPile.add_card(card_instance)
+```
+
+### 7.2 回合流程
+
+```
+[回合开始]
+        │
+        ▼
+CardsModule.start_turn()
+        │
+        ├──► CardDeck.shuffle()
+        ├──► HandArea.clear()
+        └──► CardDealer.deal_cards(CARDS_DRAWN_PER_TURN)
+                │
+                ▼
+        EventBus.fire("cards:turn_started", {...})
+                │
+                ▼
+        [玩家出牌阶段 - 可循环]
+                │
+                ▼
+[回合结束条件满足]
+        │
+        ▼
+CardsModule.end_turn()
+        │
+        ├──► PlayPhaseManager.cleanup_all()
+        ├──► DiscardPile.return_to_deck()
+        └──► EventBus.fire("cards:turn_ended", {...})
+```
+
+---
+
+## 八.配置常量
+
+> 遵循 zero-hardcoding 规范
+
+```gdscript
+# cards_module.gd 顶部
+const MAX_HAND_SIZE: int = 10
+const CARDS_DRAWN_PER_TURN: int = 3
+const MAX_RECENT_CHARGED: int = 5
+const COMBO_WINDOW_SECONDS: float = 5.0
+
+# 数据路径
+const CARD_DATA_DIR_PATH: String = "res://data/cards/"
+const CARD_DATABASE_PATH: String = "res://data/configs/card_database.tres"
+const CARD_EFFECTS_PATH: String = "res://data/configs/card_effects.tres"
+
+# 判定结果
+const JUDGE_RESULT_NONE: int = 0
+const JUDGE_RESULT_PERFECT: int = 1
+const JUDGE_RESULT_GOOD: int = 2
+const JUDGE_RESULT_MISS: int = 3
+```
+
+---
+
+## 九.设计模式应用
+
+| 模式 | 应用位置 | 目的 |
+|------|----------|------|
+| **工厂模式** | CardFactory | 创建CardInstance，封装创建逻辑 |
+| **单例模式** | CardsModule | 模块唯一入口 |
+| **适配器模式** | RhythmAdapter | 解耦节奏轴实现，便于替换 |
+| **策略模式** | ChargeCalculator | 不同的充能规则可替换 |
+| **观察者模式** | PlayContext | 生命周期回调解耦 |
+| **状态机模式** | PlayPhaseManager | 清晰的阶段转换 |
+| **中介者模式** | ChargeMediator | 协调充能相关的所有组件 |
+| **门面模式** | CardsModule | 提供统一的模块入口 |
+
+---
+
+## 十.开发自检清单
+
+### 模块边界 (module-boundary)
+- [ ] CardsModule 是模块唯一公共入口
+- [ ] 外部不直接引用 scripts/ 下的内部脚本
+- [ ] 每个 `EventBus.listen` 都有对应的 `EventBus.unlisten`
+- [ ] 每个 `add_child` 都有对应的 `remove_child` + `queue_free`
+
+### 分层架构 (layering)
+- [ ] 所有引用符合向下依赖方向
+- [ ] 核心层（core/）没有引用模块层
+- [ ] 模块间通过 EventBus 通信
+
+### 单一职责 (SRP)
+- [ ] CardData 只包含静态数据
+- [ ] CardInstance 只包含运行时状态
+- [ ] ChargeMediator 不直接操作 CardInstance（通过 PlayContext）
+- [ ] RhythmAdapter 不包含业务逻辑
+
+### 依赖倒置 (DIP)
+- [ ] RhythmAdapter 是接口，具体实现注入
+- [ ] ChargeCalculator 是接口，规则实现注入
+- [ ] ComboChecker 是接口，检测规则实现注入
+
+### 零硬编码 (zero-hardcoding)
+- [ ] 所有可变值来自常量或配置
+- [ ] 路径通过常量定义
+
+---
+
+## 十一.v1.0 → v2.0 迁移指南
+
+### 11.1 主要变化
+
+1. **CardData 拆分** - 静态数据移入CardData，运行时状态移入CardInstance
+2. **新增 PlayContext** - 为每张出牌创建独立上下文
+3. **ChargeSystem 拆分** - 拆分为 RhythmAdapter + ChargeMediator + ChargeCalculator
+4. **新增 PlayPhaseManager** - 使用状态机管理出牌阶段
+
+### 11.2 兼容性
+
+- EventBus 事件名称保持兼容
+- CardData 字段尽量保持兼容（新增字段有默认值）
+- 原有接口通过适配器兼容
+
+### 11.3 建议迁移顺序
+
+1. 添加 CardInstance、PlayContext
+2. 实现 RhythmAdapter 接口
+3. 实现 ChargeMediator
+4. 实现 PlayPhaseManager
+5. 更新 CardsModule 集成新组件
+6. 删除/废弃旧的 ChargeSystem、PlayOrderManager
+
+---
+
+*注：本架构书会随项目讨论深入持续更新*

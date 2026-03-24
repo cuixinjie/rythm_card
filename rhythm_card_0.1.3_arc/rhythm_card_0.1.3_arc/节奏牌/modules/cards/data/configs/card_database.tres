@@ -1,0 +1,59 @@
+[gd_resource type="Resource" script_class="CardDatabase" load_steps=6 format=3]
+
+[ext_resource type="Script" path="res://modules/cards/data/configs/card_database.gd" id="1_db"]
+[ext_resource type="Script" path="res://modules/cards/_core/card_data.gd" id="2_card_data"]
+
+[sub_resource type="Resource" id="Resource_strike"]
+script = ExtResource("2_card_data")
+card_id = "strike_01"
+card_name = "重击"
+card_type = "attack"
+description = "造成 15 点伤害"
+quantity = 4
+required_charge = 3
+rhythm_keys = [65, 83, 68]
+rhythm_timeout = 1.0
+combo_points = 1
+combo_tags = ["attack"]
+effect_id = "attack"
+effect_params = {"damage": 15, "target": "enemy"}
+texture_path = ""
+cost = 0
+
+[sub_resource type="Resource" id="Resource_block"]
+script = ExtResource("2_card_data")
+card_id = "block_01"
+card_name = "防御"
+card_type = "defense"
+description = "获得 10 点护盾"
+quantity = 4
+required_charge = 2
+rhythm_keys = [65, 65]
+rhythm_timeout = 1.2
+combo_points = 1
+combo_tags = ["defense"]
+effect_id = "defense"
+effect_params = {"shield": 10, "duration": 1}
+texture_path = ""
+cost = 0
+
+[sub_resource type="Resource" id="Resource_power_up"]
+script = ExtResource("2_card_data")
+card_id = "power_up_01"
+card_name = "强化"
+card_type = "buff"
+description = "攻击力 +3，持续 2 回合"
+quantity = 2
+required_charge = 3
+rhythm_keys = [65, 83, 65, 68]
+rhythm_timeout = 1.0
+combo_points = 2
+combo_tags = ["buff"]
+effect_id = "buff"
+effect_params = {"type": "strength", "value": 3, "duration": 2}
+texture_path = ""
+cost = 0
+
+[resource]
+script = ExtResource("1_db")
+cards = [SubResource("Resource_strike"), SubResource("Resource_block"), SubResource("Resource_power_up")]

@@ -1,0 +1,36 @@
+[gd_scene load_steps=3 format=3 uid="uid://test_cards_scene"]
+
+[ext_resource type="Script" path="res://modules/cards/cards_module.gd" id="1_cards_module"]
+[ext_resource type="Script" path="res://modules/cards/_services/_draw_drivers/auto_draw_driver.gd" id="2_auto_draw"]
+
+[node name="TestCards" type="Node2D"]
+script = ExtResource("1_cards_module")
+
+[node name="AutoDrawDriver" type="Node" parent="."]
+
+[node name="UILayer" type="CanvasLayer" parent="."]
+
+[node name="HandDisplay" type="VBoxContainer" parent="UILayer"]
+offset_right = 400.0
+offset_bottom = 300.0
+
+[node name="HandLabel" type="Label" parent="UILayer/HandDisplay"]
+text = "手牌:"
+
+[node name="DeckLabel" type="Label" parent="UILayer"]
+offset_top = 20.0
+offset_right = 200.0
+offset_bottom = 40.0
+text = "牌堆: 0"
+
+[node name="DiscardLabel" type="Label" parent="UILayer"]
+offset_top = 40.0
+offset_right = 200.0
+offset_bottom = 60.0
+text = "弃牌: 0"
+
+[node name="StatusLabel" type="Label" parent="UILayer"]
+offset_top = 60.0
+offset_right = 400.0
+offset_bottom = 80.0
+text = "状态: 未初始化"
